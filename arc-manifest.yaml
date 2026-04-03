@@ -1,5 +1,5 @@
 name: grove-auth
-version: 0.1.0
+version: 0.2.0
 type: custom
 tier: custom
 description: Authentication, authorization, and device trust for the metafactory ecosystem
