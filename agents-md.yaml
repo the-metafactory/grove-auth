@@ -1,0 +1,26 @@
+# agents-md.yaml — repo-specific agent rules configuration
+# Used by `arc upgrade compass` to generate CLAUDE.md from ecosystem template.
+
+template: compass-standards
+
+generate:
+  - format: claude-md
+
+# Placeholder values (substituted into templates)
+repo_name: grove-auth
+repo_description: "Authentication, authorization, and device trust for the metafactory ecosystem"
+repo_short: grove-auth
+deploy_command: "arc upgrade grove-auth"
+version_source: arc-manifest.yaml
+release_title_format: '"grove-auth vX.Y.Z — Short Description"'
+worktree_pattern: "../grove-auth-{slug}"
+sop_path_prefix: "compass/"
+
+extra_labels: []
+
+# Repo-specific sections injected at marked positions in the template
+sections:
+  - position: "after:description"
+    file: docs/agents-md/architecture.md
+  - position: "after:critical-rules"
+    file: docs/agents-md/critical-rules.md

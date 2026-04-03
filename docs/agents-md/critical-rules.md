@@ -1,0 +1,5 @@
+- NEVER store private keys, secrets, or credentials in code or config files. Use CF Worker Secrets and KV.
+- NEVER skip step-up verification for privileged actions, even in development. Use a test authenticator if needed.
+- NEVER fall back to "no auth" if a verification step fails. Fail closed, not open.
+- WebAuthn challenges MUST be single-use. Always delete from KV after verification.
+- Action tokens MUST have both expiry (exp) and nonce (jti). Verify both on every use.
