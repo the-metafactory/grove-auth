@@ -614,4 +614,24 @@ describe("audit logging", () => {
     ).get() as Record<string, unknown> | null;
     expect(row).not.toBeNull();
   });
+
+  test("admin-only role_check 403 is audited", async () => {
+    const r = req("/api/auth/users", { email: OPERATOR });
+    await app.request(r.path, r.init);
+    const row = sqlite.prepare(
+      "SELECT * FROM audit_log WHERE event_type = 'role_check' AND result = 'failure'",
+    ).get() as Record<string, unknown> | null;
+    expect(row).not.toBeNull();
+    expect(row!.identity).toBe("jc@meta-factory.ai");
+  });
+
+  test("agent_access 403 is audited", async () => {
+    const r = req("/api/auth/agents/luna", { email: VIEWER });
+    await app.request(r.path, r.init);
+    const row = sqlite.prepare(
+      "SELECT * FROM audit_log WHERE event_type = 'agent_access' AND result = 'failure'",
+    ).get() as Record<string, unknown> | null;
+    expect(row).not.toBeNull();
+    expect(row!.identity).toBe("viewer@meta-factory.ai");
+  });
 });

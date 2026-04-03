@@ -77,6 +77,12 @@ async function resolveAgentAccess(
   });
 
   if (!access.allowed) {
+    logAuditEvent(c.env.GROVE_DB, {
+      eventType: "agent_access", result: "failure",
+      ip: getClientIp(c), endpoint: new URL(c.req.url).pathname, method: c.req.method,
+      identity: user.email,
+      detail: `no_agent_access: agent=${agentId}, required=read`,
+    });
     return c.json({ error: "no_agent_access", agentId }, 403);
   }
 
@@ -132,6 +138,12 @@ authRoutes.get("/api/auth/users", async (c) => {
   const user = c.get("user");
   const result = checkRole(user.role, "admin");
   if (!result.allowed) {
+    logAuditEvent(c.env.GROVE_DB, {
+      eventType: "role_check", result: "failure",
+      ip: getClientIp(c), endpoint: new URL(c.req.url).pathname, method: "GET",
+      identity: user.email,
+      detail: `insufficient_role: has ${user.role}, needs admin`,
+    });
     return c.json({ error: result.error, required: result.required, current: result.current }, 403);
   }
 
@@ -150,6 +162,12 @@ authRoutes.put("/api/auth/users/:id/role", async (c) => {
   const caller = c.get("user");
   const result = checkRole(caller.role, "admin");
   if (!result.allowed) {
+    logAuditEvent(c.env.GROVE_DB, {
+      eventType: "role_check", result: "failure",
+      ip: getClientIp(c), endpoint: new URL(c.req.url).pathname, method: "PUT",
+      identity: caller.email,
+      detail: `insufficient_role: has ${caller.role}, needs admin`,
+    });
     return c.json({ error: result.error, required: result.required, current: result.current }, 403);
   }
 
