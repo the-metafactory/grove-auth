@@ -6,8 +6,8 @@
  */
 
 import type { Context, Next } from "hono";
-import type { AgentClass, AuthBindings, GrantScope, Role, UserRecord } from "../types";
-import { ROLE_HIERARCHY, SCOPE_HIERARCHY } from "../types";
+import type { AgentClass, AuthBindings, GrantScope, UserRecord } from "../types";
+import { checkAgentAccess } from "../authorize";
 import { logAuditEvent, getClientIp } from "./audit";
 
 /**
@@ -65,47 +65,33 @@ export function requireAgentAccess(requiredScope: GrantScope) {
       return c.json({ error: "agent_not_found", agentId }, 404);
     }
 
-    // Resolution order: owner → grant → admin → cattle
-    let resolution: string | null = null;
-    let availableScope: GrantScope = "control"; // owners and admins get full scope
+    const result = checkAgentAccess({
+      userId: user.id,
+      userRole: user.role,
+      agentOwnerId: row.owner_id,
+      agentClass: row.agent_class,
+      grantScope: row.grant_scope,
+      requiredScope,
+    });
 
-    // 1. Owner check
-    if (row.owner_id === user.id) {
-      resolution = "owner";
-    }
-    // 2. Active grant check
-    else if (row.grant_scope && SCOPE_HIERARCHY[row.grant_scope] >= SCOPE_HIERARCHY[requiredScope]) {
-      resolution = "grant";
-      availableScope = row.grant_scope;
-    }
-    // 3. Admin bypass
-    else if (user.role === "admin") {
-      resolution = "admin";
-    }
-    // 4. Cattle open access (any operator)
-    else if (row.agent_class === "cattle" && ROLE_HIERARCHY[user.role] >= ROLE_HIERARCHY["operator"]) {
-      resolution = "cattle";
-    }
-
-    if (!resolution) {
-      const grantInfo = row.grant_scope ? `available_scope=${row.grant_scope}` : "no_grant";
+    if (!result.allowed) {
       logAuditEvent(c.env.GROVE_DB, {
         eventType: "agent_access", result: "failure", ip, endpoint, method,
         identity: user.email,
-        detail: `no_agent_access: agent=${agentId}, required=${requiredScope}, ${grantInfo}`,
+        detail: `no_agent_access: agent=${agentId}, required=${requiredScope}, available=${result.availableScope ?? "none"}`,
       });
       return c.json({
-        error: "no_agent_access",
+        error: result.error,
         agentId,
         required_scope: requiredScope,
-        available_scope: row.grant_scope ?? null,
+        available_scope: result.availableScope,
       }, 403);
     }
 
     logAuditEvent(c.env.GROVE_DB, {
       eventType: "agent_access", result: "success", ip, endpoint, method,
       identity: user.email,
-      detail: `agent=${agentId}, scope=${requiredScope}, resolution=${resolution}, available=${availableScope}`,
+      detail: `agent=${agentId}, scope=${requiredScope}, resolution=${result.resolution}, available=${result.availableScope}`,
     });
     await next();
   };

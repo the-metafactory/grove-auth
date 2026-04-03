@@ -6,7 +6,7 @@
 
 import type { Context, Next } from "hono";
 import type { AuthBindings, Role, UserRecord } from "../types";
-import { ROLE_HIERARCHY } from "../types";
+import { checkRole } from "../authorize";
 import { getCfAccessEmail } from "./cf-access";
 import { logAuditEvent, getClientIp } from "./audit";
 
@@ -47,12 +47,13 @@ export function requireRole(minRole: Role) {
       return c.json({ error: "user not provisioned", email }, 401);
     }
 
-    if (ROLE_HIERARCHY[user.role] < ROLE_HIERARCHY[minRole]) {
+    const result = checkRole(user.role, minRole);
+    if (!result.allowed) {
       logAuditEvent(c.env.GROVE_DB, {
         eventType: "role_check", result: "failure", ip, endpoint, method,
         identity: email, detail: `insufficient_role: has ${user.role}, needs ${minRole}`,
       });
-      return c.json({ error: "insufficient_role", required: minRole, current: user.role }, 403);
+      return c.json({ error: result.error, required: result.required, current: result.current }, 403);
     }
 
     logAuditEvent(c.env.GROVE_DB, {

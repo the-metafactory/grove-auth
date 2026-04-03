@@ -5,20 +5,23 @@
 
 import type { AuthBindings } from "../types";
 
+/** CF Access JWKs include `kid` which standard JsonWebKey does not. */
+type CfAccessJwk = JsonWebKey & { kid?: string };
+
 const CF_ACCESS_TEAM = "metafactory";
 const CF_CERTS_URL = `https://${CF_ACCESS_TEAM}.cloudflareaccess.com/cdn-cgi/access/certs`;
 
 // Cache the JWK keyset in module scope (warm across requests within same isolate)
-let cachedKeys: { keys: JsonWebKey[]; fetchedAt: number } | null = null;
+let cachedKeys: { keys: CfAccessJwk[]; fetchedAt: number } | null = null;
 const KEY_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
-async function getCfAccessKeys(): Promise<JsonWebKey[]> {
+async function getCfAccessKeys(): Promise<CfAccessJwk[]> {
   if (cachedKeys && Date.now() - cachedKeys.fetchedAt < KEY_CACHE_TTL_MS) {
     return cachedKeys.keys;
   }
   const res = await fetch(CF_CERTS_URL);
   if (!res.ok) throw new Error(`Failed to fetch CF Access certs: ${res.status}`);
-  const data = await res.json() as { keys: JsonWebKey[] };
+  const data = await res.json() as { keys: CfAccessJwk[] };
   cachedKeys = { keys: data.keys, fetchedAt: Date.now() };
   return data.keys;
 }
@@ -72,12 +75,13 @@ export async function validateCfAccessJwt(
   const aud = payload.aud;
   if (Array.isArray(aud) ? !aud.includes(audience) : aud !== audience) return null;
 
+  // Reject tokens without expiry — CF Access tokens should always include exp
   const exp = payload.exp as number | undefined;
-  if (exp && exp < Math.floor(Date.now() / 1000)) return null;
+  if (!exp || exp < Math.floor(Date.now() / 1000)) return null;
 
   const keys = await getCfAccessKeys();
   const matchingKeys = header.kid
-    ? keys.filter((k) => (k as any).kid === header.kid)
+    ? keys.filter((k) => k.kid === header.kid)
     : keys;
 
   const signedData = new TextEncoder().encode(`${headerB64}.${payloadB64}`);

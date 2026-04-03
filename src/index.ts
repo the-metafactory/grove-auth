@@ -26,3 +26,6 @@ export type {
 } from "./types";
 
 export { ROLE_HIERARCHY, SCOPE_HIERARCHY } from "./types";
+
+export { checkRole, checkAgentAccess } from "./authorize";
+export type { RoleCheckResult, AgentAccessInput, AgentAccessResult } from "./authorize";

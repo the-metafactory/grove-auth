@@ -1,6 +1,6 @@
 {
   "name": "grove-auth",
-  "version": "0.3.0",
+  "version": "0.2.0",
   "type": "module",
   "private": true,
   "description": "Authentication, authorization, and device trust for the metafactory ecosystem",
