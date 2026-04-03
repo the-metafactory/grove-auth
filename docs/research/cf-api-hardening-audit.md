@@ -3,6 +3,7 @@
 **Date:** 2026-04-03
 **Source:** Codebase audit of miner-server, grove Worker, and grove-auth
 **Purpose:** Identify security patterns, gaps, and inconsistencies across the ecosystem's Cloudflare Worker APIs to inform grove-auth's auth design.
+**See also:** `cf-workers-auth.md` for external CF Access platform research (how the platform works). This doc covers how our code implements it and where the gaps are.
 
 ---
 
@@ -11,16 +12,16 @@
 ### S-001: CF Access JWT Validation (Network Layer Auth)
 
 All three codebases implement CF Access JWT validation:
-- **miner-server:** `src/auth.ts` (lines 80-219)
-- **grove:** `src/worker/src/auth.ts` (lines 121-263)
-- **grove-auth:** `src/middleware/cf-access.ts`
+- **miner-server:** `src/auth.ts` (`validateCfAccessJwt`, `getCfAccessEmail`, `requireCfAccess`)
+- **grove:** `src/worker/src/auth.ts` (`validateCfAccessJwt`, `getCfAccessEmail`, `requireCfAccess`)
+- **grove-auth:** `src/middleware/cf-access.ts` (`validateCfAccessJwt`, `getCfAccessEmail`)
 
 Features: JWK caching (10min TTL), RS256 validation, audience + expiration checks, CF_Authorization cookie + Cf-Access-Jwt-Assertion header support, audit logging on success/failure, optional bypass when CF_ACCESS_AUD not configured (local dev).
 
 ### S-002: CORS Origin Allowlisting
 
-- **miner-server:** `src/index.ts` (lines 36-46) — `https://miner.meta-factory.ai`, `http://localhost:8767`
-- **grove:** `src/worker/src/index.ts` (lines 36-47) — `https://grove.meta-factory.ai`, `http://localhost:8766,8765`
+- **miner-server:** `src/index.ts` (CORS middleware config) — `https://miner.meta-factory.ai`, `http://localhost:8767`
+- **grove:** `src/worker/src/index.ts` (CORS middleware config) — `https://grove.meta-factory.ai`, `http://localhost:8766,8765`
 
 Env-configurable, comma-separated multi-origin, Hono CORS middleware, credentials enabled.
 
@@ -64,7 +65,7 @@ Both workers use `requireApiKey()` middleware — Bearer token validated against
 **Risk:** ADMIN_SECRET is a single shared credential — all admins are indistinguishable in audit logs ("identity: admin").
 **Affected:** miner-server `requireAdmin()`, grove `requireAdmin()`
 **Fix:** grove-auth replaces this with `requireRole("admin")` — admin users identified by email via CF Access JWT + D1 lookup. Both workers should migrate.
-**Phase:** 1.6 (grove integration)
+**Phase:** 1.6 (grove integration) — tracked in `iteration-1.md` §1.6, not as a standalone issue.
 
 ### Gap 2: API Key Metadata Lacks Issuer
 
@@ -77,13 +78,17 @@ Both workers use `requireApiKey()` middleware — Bearer token validated against
 
 **Risk:** In-memory counters reset on isolate recycle — rate limits are ineffective under high request volume or during deployments.
 **Affected:** `grove/src/worker/src/rate-limiter.ts`
-**Fix:** Migrate to KV-backed sliding window (same approach as miner-server).
+**Fix:** Migrate to a persistent rate limiter. Two options:
+- **KV-backed sliding window** (what miner-server uses) — works for per-minute windows despite KV's 60s eventual consistency, proven in production. Simpler, no extra binding.
+- **Durable Objects** (recommended by `cf-workers-auth.md` research) — true sliding window with sub-second precision, better for sub-minute windows or per-user throttling. Requires DO binding.
+
+For grove's current rate limit tiers (60-300 req/min), KV is sufficient. If auth rate limiting needs tighter windows (e.g., 5 attempts per 5 minutes for login), DOs are the better choice. Decision deferred to implementation time.
 **Phase:** Future (grove hardening, not grove-auth scope)
 
 ### Gap 4: CF Access JWT Expiration Handling Inconsistent
 
 **Risk:** miner-server and grove accept tokens without `exp` claim. CF Access always includes `exp`, but a crafted token without it would pass validation.
-**Affected:** miner-server `src/auth.ts` (line 158-159), grove `src/worker/src/auth.ts`
+**Affected:** miner-server `src/auth.ts` (`validateCfAccessJwt`), grove `src/worker/src/auth.ts` (`validateCfAccessJwt`)
 **Fix:** grove-auth already implements stricter check (`if (!exp || exp < ...)`). Backport to miner-server and grove.
 **Phase:** Future (backport from grove-auth)
 
@@ -140,7 +145,7 @@ Document decisions on:
 ### Future (cross-cutting hardening)
 
 - Gap 2: API key issuer metadata
-- Gap 3: KV-backed rate limiting in grove
+- Gap 3: Persistent rate limiting in grove (KV or DO — see Gap 3 notes)
 - Gap 6: Unified audit event schema
 - Gap 8: Canonical audit query API
 
@@ -148,13 +153,13 @@ Document decisions on:
 
 ## 4. Summary Table
 
-| Pattern | Miner-Server | Grove | Grove-Auth | Status |
-|---------|-------------|-------|------------|--------|
-| CF Access JWT | 10min cache, RS256 | 10min cache, RS256 | Stricter exp check | grove-auth is canonical |
-| CORS Allowlist | Env-configured | Env-configured | N/A | Aligned |
-| Rate Limiting | KV-backed | In-memory (Gap 3) | N/A | Grove should migrate to KV |
-| Input Validation | Parameterized SQL | Parameterized SQL | Parameterized SQL | Aligned |
-| Audit Logging | Fire-and-forget D1 | Fire-and-forget D1 | Reusable helper | grove-auth canonical |
-| PII Scrubbing | Regex-based | None (Gap 5) | N/A | Decision needed |
-| Admin Auth | Shared secret (Gap 1) | Shared secret (Gap 1) | Role-based | grove-auth fixes this |
-| API Key Lifecycle | No issuer (Gap 2) | No issuer (Gap 2) | N/A | Future improvement |
+| Pattern | Miner-Server | Grove | Grove-Auth | Status | Issue |
+|---------|-------------|-------|------------|--------|-------|
+| CF Access JWT | 10min cache, RS256 | 10min cache, RS256 | Stricter exp check | grove-auth is canonical | #9 (backport) |
+| CORS Allowlist | Env-configured | Env-configured | N/A | Aligned | — |
+| Rate Limiting | KV-backed | In-memory (Gap 3) | N/A | Grove needs persistent limiter | #8 |
+| Input Validation | Parameterized SQL | Parameterized SQL | Parameterized SQL | Aligned | — |
+| Audit Logging | Fire-and-forget D1 | Fire-and-forget D1 | Reusable helper | grove-auth canonical | #6 (schema) |
+| PII Scrubbing | Regex-based | None (Gap 5) | N/A | Decision needed | #10 |
+| Admin Auth | Shared secret (Gap 1) | Shared secret (Gap 1) | Role-based | grove-auth fixes this | iter-1 §1.6 |
+| API Key Lifecycle | No issuer (Gap 2) | No issuer (Gap 2) | N/A | Future improvement | #7 |
