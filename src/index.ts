@@ -6,6 +6,8 @@
  */
 
 export {
+  requireAuth,
+  authenticateUser,
   requireRole,
   requireAgentAccess,
   getUserByEmail,

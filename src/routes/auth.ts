@@ -7,57 +7,31 @@
  *   GET  /api/auth/users                 — list all users (admin)
  *   PUT  /api/auth/users/:id/role        — change user role (admin)
  *   GET  /api/auth/agents                — list agents (context-filtered)
- *   GET  /api/auth/agents/:agentId       — agent detail
+ *   GET  /api/auth/agents/:agentId       — agent detail (requires read access)
  *   POST /api/auth/agents/:agentId/grants — create grant (owner/admin)
- *   GET  /api/auth/agents/:agentId/grants — list grants for agent
+ *   GET  /api/auth/agents/:agentId/grants — list grants for agent (requires read access)
  *   DELETE /api/auth/grants/:grantId     — revoke grant
  *
  * Design: grove-auth/docs/design-auth-aaa.md v2
  */
 
 import { Hono } from "hono";
-import type { AuthBindings, GrantScope, Role, UserRecord } from "../types";
-import { ROLE_HIERARCHY } from "../types";
-import { checkRole } from "../authorize";
+import type { AuthBindings, AgentRecord, GrantScope, Role, UserRecord } from "../types";
+import { checkRole, checkAgentAccess } from "../authorize";
 import { logAuditEvent, getClientIp } from "../middleware/audit";
-import { getCfAccessEmail } from "../middleware/cf-access";
-import { getUserByEmail } from "../middleware/require-role";
+import { requireAuth } from "../middleware/require-auth";
+
+const MAX_ID_LENGTH = 128;
 
 type AuthEnv = { Bindings: AuthBindings; Variables: { user: UserRecord } };
 
 export const authRoutes = new Hono<AuthEnv>();
 
 // ---------------------------------------------------------------------------
-// Inline auth middleware for this route group
-// Extracts user from CF Access JWT → D1 lookup → sets c.var.user
+// Auth middleware — uses shared requireAuth() (CF Access → D1 → set user)
 // ---------------------------------------------------------------------------
 
-authRoutes.use("/api/auth/*", async (c, next) => {
-  const ip = getClientIp(c);
-  const endpoint = new URL(c.req.url).pathname;
-  const method = c.req.method;
-
-  const email = await getCfAccessEmail(c.env, c.req);
-  if (!email) {
-    logAuditEvent(c.env.GROVE_DB, {
-      eventType: "auth_api", result: "failure", ip, endpoint, method,
-      detail: "no CF Access identity",
-    });
-    return c.json({ error: "authentication required" }, 401);
-  }
-
-  const user = await getUserByEmail(c.env.GROVE_DB, email);
-  if (!user) {
-    logAuditEvent(c.env.GROVE_DB, {
-      eventType: "auth_api", result: "failure", ip, endpoint, method,
-      identity: email, detail: "user not provisioned",
-    });
-    return c.json({ error: "user not provisioned", email }, 401);
-  }
-
-  c.set("user", user);
-  await next();
-});
+authRoutes.use("/api/auth/*", requireAuth());
 
 // ---------------------------------------------------------------------------
 // GET /api/auth/me — current user profile
@@ -124,16 +98,27 @@ authRoutes.put("/api/auth/users/:id/role", async (c) => {
     return c.json({ error: "invalid role", valid: ["viewer", "operator", "admin"] }, 400);
   }
 
-  const target = await c.env.GROVE_DB.prepare("SELECT * FROM users WHERE id = ?").bind(targetId).first<UserRecord>();
+  const db = c.env.GROVE_DB;
+  const target = await db.prepare("SELECT * FROM users WHERE id = ?").bind(targetId).first<UserRecord>();
   if (!target) {
     return c.json({ error: "user_not_found", id: targetId }, 404);
   }
 
-  await c.env.GROVE_DB.prepare(
+  // Guard: prevent demoting the last admin
+  if (target.role === "admin" && body.role !== "admin") {
+    const adminCount = await db.prepare(
+      "SELECT COUNT(*) as n FROM users WHERE role = 'admin'",
+    ).first<{ n: number }>();
+    if (adminCount && adminCount.n <= 1) {
+      return c.json({ error: "cannot_demote_last_admin" }, 409);
+    }
+  }
+
+  await db.prepare(
     "UPDATE users SET role = ?, updated_at = datetime('now') WHERE id = ?",
   ).bind(body.role, targetId).run();
 
-  logAuditEvent(c.env.GROVE_DB, {
+  logAuditEvent(db, {
     eventType: "role_change", result: "success",
     ip: getClientIp(c), endpoint: new URL(c.req.url).pathname, method: "PUT",
     identity: caller.email,
@@ -152,7 +137,6 @@ authRoutes.get("/api/auth/agents", async (c) => {
   const db = c.env.GROVE_DB;
 
   if (user.role === "admin") {
-    // Admin sees all agents
     const agents = await db.prepare("SELECT * FROM agents ORDER BY created_at").all();
     return c.json({ agents: agents.results });
   }
@@ -177,27 +161,51 @@ authRoutes.get("/api/auth/agents", async (c) => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /api/auth/agents/:agentId — agent detail
+// GET /api/auth/agents/:agentId — agent detail (requires read access)
 // ---------------------------------------------------------------------------
 
 authRoutes.get("/api/auth/agents/:agentId", async (c) => {
+  const user = c.get("user");
   const agentId = c.req.param("agentId");
   const db = c.env.GROVE_DB;
 
-  const agent = await db.prepare("SELECT * FROM agents WHERE id = ?").bind(agentId).first();
+  const agent = await db.prepare("SELECT * FROM agents WHERE id = ?").bind(agentId).first<AgentRecord>();
   if (!agent) {
     return c.json({ error: "agent_not_found", agentId }, 404);
   }
 
-  const grants = await db.prepare(`
-    SELECT g.*, u.display_name AS grantee_name, u.email AS grantee_email
-    FROM agent_grants g JOIN users u ON g.grantee_id = u.id
-    WHERE g.agent_id = ? AND g.revoked_at IS NULL
-  `).bind(agentId).all();
+  // Authorization: owner → grant → admin → cattle
+  const grantRow = await db.prepare(`
+    SELECT scope FROM agent_grants
+    WHERE agent_id = ? AND grantee_id = ? AND revoked_at IS NULL
+    AND (expires_at IS NULL OR expires_at > datetime('now'))
+    ORDER BY CASE scope WHEN 'control' THEN 2 WHEN 'review' THEN 1 WHEN 'read' THEN 0 END DESC
+    LIMIT 1
+  `).bind(agentId, user.id).first<{ scope: GrantScope }>();
 
-  const owner = await db.prepare(
-    "SELECT id, display_name, email FROM users WHERE id = ?",
-  ).bind(agent.owner_id as string).first();
+  const access = checkAgentAccess({
+    userId: user.id,
+    userRole: user.role,
+    agentOwnerId: agent.owner_id,
+    agentClass: agent.class,
+    grantScope: grantRow?.scope ?? null,
+    requiredScope: "read",
+  });
+
+  if (!access.allowed) {
+    return c.json({ error: "no_agent_access", agentId }, 403);
+  }
+
+  const [grants, owner] = await Promise.all([
+    db.prepare(`
+      SELECT g.*, u.display_name AS grantee_name, u.email AS grantee_email
+      FROM agent_grants g JOIN users u ON g.grantee_id = u.id
+      WHERE g.agent_id = ? AND g.revoked_at IS NULL
+    `).bind(agentId).all(),
+    db.prepare(
+      "SELECT id, display_name, email FROM users WHERE id = ?",
+    ).bind(agent.owner_id).first(),
+  ]);
 
   return c.json({ agent, owner, grants: grants.results });
 });
@@ -211,13 +219,19 @@ authRoutes.post("/api/auth/agents/:agentId/grants", async (c) => {
   const agentId = c.req.param("agentId");
   const db = c.env.GROVE_DB;
 
-  const agent = await db.prepare("SELECT * FROM agents WHERE id = ?").bind(agentId).first();
+  const agent = await db.prepare("SELECT * FROM agents WHERE id = ?").bind(agentId).first<AgentRecord>();
   if (!agent) {
     return c.json({ error: "agent_not_found", agentId }, 404);
   }
 
   // Only owner or admin can create grants
   if (agent.owner_id !== caller.id && caller.role !== "admin") {
+    logAuditEvent(db, {
+      eventType: "grant_create", result: "failure",
+      ip: getClientIp(c), endpoint: new URL(c.req.url).pathname, method: "POST",
+      identity: caller.email,
+      detail: `unauthorized: agent=${agentId}, caller_role=${caller.role}`,
+    });
     return c.json({ error: "only owner or admin can create grants" }, 403);
   }
 
@@ -234,6 +248,12 @@ authRoutes.post("/api/auth/agents/:agentId/grants", async (c) => {
   if (!["read", "review", "control"].includes(body.scope)) {
     return c.json({ error: "invalid scope", valid: ["read", "review", "control"] }, 400);
   }
+  if (body.grantee_id.length > MAX_ID_LENGTH) {
+    return c.json({ error: "grantee_id too long" }, 400);
+  }
+  if (body.expires_at && isNaN(Date.parse(body.expires_at))) {
+    return c.json({ error: "invalid expires_at format" }, 400);
+  }
 
   // Verify grantee exists
   const grantee = await db.prepare("SELECT id FROM users WHERE id = ?").bind(body.grantee_id).first();
@@ -248,7 +268,7 @@ authRoutes.post("/api/auth/agents/:agentId/grants", async (c) => {
   `).bind(
     grantId,
     agentId,
-    agent.owner_id as string,
+    agent.owner_id,
     body.grantee_id,
     body.scope,
     body.requires_stepup === false ? 0 : 1,
@@ -270,12 +290,35 @@ authRoutes.post("/api/auth/agents/:agentId/grants", async (c) => {
 // ---------------------------------------------------------------------------
 
 authRoutes.get("/api/auth/agents/:agentId/grants", async (c) => {
+  const user = c.get("user");
   const agentId = c.req.param("agentId");
   const db = c.env.GROVE_DB;
 
-  const agent = await db.prepare("SELECT id FROM agents WHERE id = ?").bind(agentId).first();
+  const agent = await db.prepare("SELECT * FROM agents WHERE id = ?").bind(agentId).first<AgentRecord>();
   if (!agent) {
     return c.json({ error: "agent_not_found", agentId }, 404);
+  }
+
+  // Authorization: owner → grant → admin → cattle
+  const grantRow = await db.prepare(`
+    SELECT scope FROM agent_grants
+    WHERE agent_id = ? AND grantee_id = ? AND revoked_at IS NULL
+    AND (expires_at IS NULL OR expires_at > datetime('now'))
+    ORDER BY CASE scope WHEN 'control' THEN 2 WHEN 'review' THEN 1 WHEN 'read' THEN 0 END DESC
+    LIMIT 1
+  `).bind(agentId, user.id).first<{ scope: GrantScope }>();
+
+  const access = checkAgentAccess({
+    userId: user.id,
+    userRole: user.role,
+    agentOwnerId: agent.owner_id,
+    agentClass: agent.class,
+    grantScope: grantRow?.scope ?? null,
+    requiredScope: "read",
+  });
+
+  if (!access.allowed) {
+    return c.json({ error: "no_agent_access", agentId }, 403);
   }
 
   const grants = await db.prepare(`
@@ -310,6 +353,12 @@ authRoutes.delete("/api/auth/grants/:grantId", async (c) => {
 
   // Only grant owner or admin can revoke
   if (grant.owner_id !== caller.id && caller.role !== "admin") {
+    logAuditEvent(db, {
+      eventType: "grant_revoke", result: "failure",
+      ip: getClientIp(c), endpoint: new URL(c.req.url).pathname, method: "DELETE",
+      identity: caller.email,
+      detail: `unauthorized: grant=${grantId}, caller_role=${caller.role}`,
+    });
     return c.json({ error: "only owner or admin can revoke grants" }, 403);
   }
 

@@ -1,236 +1,339 @@
 /**
  * GA-1 (1.5): Tests for auth API route group.
- * Uses a mock D1 and injects user identity via X-Test-Email header.
+ * Mounts the REAL authRoutes with a Bun SQLite-backed D1 mock.
+ * CF Access is mocked to use X-Test-Email header for identity injection.
  */
 
-import { describe, test, expect, beforeEach } from "bun:test";
+import { describe, test, expect, beforeEach, mock } from "bun:test";
+import { Database } from "bun:sqlite";
 import { Hono } from "hono";
-import type { UserRecord, GrantScope } from "../types";
-import { checkRole } from "../authorize";
 
-// =============================================================================
-// Mock data store + test app
-// =============================================================================
+// ---------------------------------------------------------------------------
+// Mock CF Access — use X-Test-Email header instead of JWT validation
+// Must be called before importing authRoutes
+// ---------------------------------------------------------------------------
 
-interface MockStore {
-  users: UserRecord[];
-  agents: Array<{ id: string; display_name: string; owner_id: string; class: "pet" | "cattle"; backend: string | null; spawn_profile: string | null; created_at: string }>;
-  grants: Array<{ id: string; agent_id: string; owner_id: string; grantee_id: string; scope: GrantScope; requires_stepup: number; expires_at: string | null; created_at: string; revoked_at: string | null }>;
+mock.module("../middleware/cf-access", () => ({
+  getCfAccessEmail: async (_env: unknown, req: { header(name: string): string | undefined }) => {
+    return req.header("X-Test-Email") ?? null;
+  },
+  validateCfAccessJwt: async () => null,
+}));
+
+// Import real authRoutes AFTER mock is in place
+const { authRoutes } = await import("./auth");
+
+// ---------------------------------------------------------------------------
+// D1 mock backed by Bun's built-in SQLite
+// ---------------------------------------------------------------------------
+
+function createMockD1(sqlite: InstanceType<typeof Database>) {
+  return {
+    prepare(query: string) {
+      let boundValues: unknown[] = [];
+      return {
+        bind(...values: unknown[]) {
+          boundValues = values;
+          return this;
+        },
+        async first<T = Record<string, unknown>>(): Promise<T | null> {
+          try {
+            const stmt = sqlite.prepare(query);
+            const row = stmt.get(...boundValues);
+            return (row as T) ?? null;
+          } catch (_err) {
+            return null;
+          }
+        },
+        async all<T = Record<string, unknown>>(): Promise<{ results: T[] }> {
+          try {
+            const stmt = sqlite.prepare(query);
+            const rows = stmt.all(...boundValues);
+            return { results: rows as T[] };
+          } catch (_err) {
+            return { results: [] };
+          }
+        },
+        async run() {
+          try {
+            const stmt = sqlite.prepare(query);
+            stmt.run(...boundValues);
+          } catch (_err) {
+            // Audit log writes may fail in test — acceptable
+          }
+          return { results: [], success: true, meta: {} };
+        },
+      };
+    },
+  } as unknown as D1Database;
 }
 
-function defaultStore(): MockStore {
+function createTestDb(): { db: D1Database; sqlite: InstanceType<typeof Database> } {
+  const sqlite = new Database(":memory:");
+
+  sqlite.run(`
+    CREATE TABLE users (
+      id TEXT PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      display_name TEXT,
+      role TEXT NOT NULL DEFAULT 'viewer' CHECK(role IN ('viewer', 'operator', 'admin')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  sqlite.run(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      display_name TEXT NOT NULL,
+      owner_id TEXT NOT NULL,
+      class TEXT NOT NULL DEFAULT 'pet' CHECK(class IN ('pet', 'cattle')),
+      backend TEXT,
+      spawn_profile TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id)
+    )
+  `);
+  sqlite.run(`
+    CREATE TABLE agent_grants (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      owner_id TEXT NOT NULL,
+      grantee_id TEXT NOT NULL,
+      scope TEXT NOT NULL DEFAULT 'read' CHECK(scope IN ('read', 'review', 'control')),
+      requires_stepup INTEGER DEFAULT 1,
+      expires_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      revoked_at TEXT,
+      FOREIGN KEY (agent_id) REFERENCES agents(id),
+      FOREIGN KEY (owner_id) REFERENCES users(id),
+      FOREIGN KEY (grantee_id) REFERENCES users(id)
+    )
+  `);
+  sqlite.run(`
+    CREATE TABLE audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_type TEXT NOT NULL,
+      result TEXT NOT NULL,
+      ip TEXT,
+      endpoint TEXT,
+      method TEXT,
+      identity TEXT,
+      detail TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+
+  return { db: createMockD1(sqlite), sqlite };
+}
+
+function seedTestData(sqlite: InstanceType<typeof Database>) {
+  sqlite.run(`
+    INSERT INTO users (id, email, display_name, role) VALUES
+      ('andreas', 'andreas@meta-factory.ai', 'Andreas', 'admin'),
+      ('jc', 'jc@meta-factory.ai', 'JC', 'operator'),
+      ('viewer1', 'viewer@meta-factory.ai', 'Viewer', 'viewer')
+  `);
+  sqlite.run(`
+    INSERT INTO agents (id, display_name, owner_id, class, backend) VALUES
+      ('luna', 'Luna', 'andreas', 'pet', 'local'),
+      ('ivy', 'Ivy', 'jc', 'pet', 'ec2'),
+      ('review-worker', 'Review Worker', 'andreas', 'cattle', 'ec2')
+  `);
+  sqlite.run(`
+    INSERT INTO agent_grants (id, agent_id, owner_id, grantee_id, scope, requires_stepup)
+    VALUES ('grant-1', 'luna', 'andreas', 'jc', 'review', 1)
+  `);
+}
+
+// ---------------------------------------------------------------------------
+// Test app builder — mounts REAL authRoutes with mock D1 bindings
+// ---------------------------------------------------------------------------
+
+function buildTestApp(mockD1: D1Database) {
+  const app = new Hono();
+  // Mount the real production routes
+  app.route("/", authRoutes);
+
+  const env = { GROVE_DB: mockD1, CF_ACCESS_AUD: "test-audience" };
+
+  // Return a wrapper that injects env into every request
   return {
-    users: [
-      { id: "andreas", email: "andreas@meta-factory.ai", display_name: "Andreas", role: "admin", created_at: "2026-01-01", updated_at: "2026-01-01" },
-      { id: "jc", email: "jc@meta-factory.ai", display_name: "JC", role: "operator", created_at: "2026-01-01", updated_at: "2026-01-01" },
-      { id: "viewer1", email: "viewer@meta-factory.ai", display_name: "Viewer", role: "viewer", created_at: "2026-01-01", updated_at: "2026-01-01" },
-    ],
-    agents: [
-      { id: "luna", display_name: "Luna", owner_id: "andreas", class: "pet", backend: "local", spawn_profile: null, created_at: "2026-01-01" },
-      { id: "ivy", display_name: "Ivy", owner_id: "jc", class: "pet", backend: "ec2", spawn_profile: null, created_at: "2026-01-01" },
-      { id: "review-worker", display_name: "Review Worker", owner_id: "andreas", class: "cattle", backend: "ec2", spawn_profile: null, created_at: "2026-01-01" },
-    ],
-    grants: [
-      { id: "grant-1", agent_id: "luna", owner_id: "andreas", grantee_id: "jc", scope: "review", requires_stepup: 1, expires_at: null, created_at: "2026-01-01", revoked_at: null },
-    ],
+    async request(path: string, init?: RequestInit) {
+      return app.request(path, init, env);
+    },
   };
 }
 
-/**
- * Build a test Hono app that mirrors the auth route logic using the mock store.
- * This tests the actual route structure and uses checkRole() from production code.
- */
-function buildTestApp(store: MockStore) {
-  const app = new Hono();
+// ---------------------------------------------------------------------------
+// Helper
+// ---------------------------------------------------------------------------
 
-  // Auth middleware — inject user from X-Test-Email
-  app.use("/api/auth/*", async (c: any, next: any) => {
-    const email = c.req.header("X-Test-Email");
-    if (!email) return c.json({ error: "authentication required" }, 401);
-    const user = store.users.find((u) => u.email === email);
-    if (!user) return c.json({ error: "user not provisioned", email }, 401);
-    c.set("user", user);
-    await next();
-  });
-
-  // GET /api/auth/me
-  app.get("/api/auth/me", (c: any) => {
-    const user = c.get("user") as UserRecord;
-    const agents = store.agents.filter((a) => a.owner_id === user.id);
-    const now = new Date().toISOString();
-    const received = store.grants.filter((g) => g.grantee_id === user.id && !g.revoked_at && (!g.expires_at || g.expires_at > now));
-    const given = store.grants.filter((g) => g.owner_id === user.id && !g.revoked_at);
-    return c.json({ user, agents, grants: { received, given } });
-  });
-
-  // GET /api/auth/users (admin only — uses production checkRole)
-  app.get("/api/auth/users", (c: any) => {
-    const user = c.get("user") as UserRecord;
-    const result = checkRole(user.role, "admin");
-    if (!result.allowed) return c.json({ error: result.error, required: result.required, current: result.current }, 403);
-    return c.json({ users: store.users });
-  });
-
-  // PUT /api/auth/users/:id/role (admin only)
-  app.put("/api/auth/users/:id/role", async (c: any) => {
-    const caller = c.get("user") as UserRecord;
-    const result = checkRole(caller.role, "admin");
-    if (!result.allowed) return c.json({ error: result.error, required: result.required, current: result.current }, 403);
-    const targetId = c.req.param("id");
-    const body = await c.req.json().catch(() => null);
-    if (!body?.role || !["viewer", "operator", "admin"].includes(body.role)) return c.json({ error: "invalid role" }, 400);
-    const target = store.users.find((u) => u.id === targetId);
-    if (!target) return c.json({ error: "user_not_found" }, 404);
-    const prev = target.role;
-    target.role = body.role;
-    return c.json({ ok: true, id: targetId, previous_role: prev, new_role: body.role });
-  });
-
-  // GET /api/auth/agents (context-filtered)
-  app.get("/api/auth/agents", (c: any) => {
-    const user = c.get("user") as UserRecord;
-    if (user.role === "admin") return c.json({ agents: store.agents });
-    const now = new Date().toISOString();
-    const owned = store.agents.filter((a) => a.owner_id === user.id);
-    const delegated = store.agents.filter((a) => store.grants.some((g) => g.agent_id === a.id && g.grantee_id === user.id && !g.revoked_at && (!g.expires_at || g.expires_at > now)));
-    const cattle = store.agents.filter((a) => a.class === "cattle");
-    return c.json({ owned, delegated, cattle });
-  });
-
-  // GET /api/auth/agents/:agentId
-  app.get("/api/auth/agents/:agentId", (c: any) => {
-    const agentId = c.req.param("agentId");
-    const agent = store.agents.find((a) => a.id === agentId);
-    if (!agent) return c.json({ error: "agent_not_found", agentId }, 404);
-    const owner = store.users.find((u) => u.id === agent.owner_id);
-    const grants = store.grants.filter((g) => g.agent_id === agentId && !g.revoked_at);
-    return c.json({ agent, owner, grants });
-  });
-
-  // POST /api/auth/agents/:agentId/grants
-  app.post("/api/auth/agents/:agentId/grants", async (c: any) => {
-    const caller = c.get("user") as UserRecord;
-    const agentId = c.req.param("agentId");
-    const agent = store.agents.find((a) => a.id === agentId);
-    if (!agent) return c.json({ error: "agent_not_found" }, 404);
-    if (agent.owner_id !== caller.id && caller.role !== "admin") return c.json({ error: "only owner or admin can create grants" }, 403);
-    const body = await c.req.json().catch(() => null);
-    if (!body?.grantee_id || !body?.scope) return c.json({ error: "grantee_id and scope are required" }, 400);
-    if (!["read", "review", "control"].includes(body.scope)) return c.json({ error: "invalid scope" }, 400);
-    const grantee = store.users.find((u) => u.id === body.grantee_id);
-    if (!grantee) return c.json({ error: "grantee_not_found" }, 404);
-    const grantId = `grant-${Date.now()}`;
-    store.grants.push({ id: grantId, agent_id: agentId, owner_id: agent.owner_id, grantee_id: body.grantee_id, scope: body.scope, requires_stepup: 1, expires_at: body.expires_at ?? null, created_at: new Date().toISOString(), revoked_at: null });
-    return c.json({ ok: true, grant_id: grantId }, 201);
-  });
-
-  // DELETE /api/auth/grants/:grantId
-  app.delete("/api/auth/grants/:grantId", (c: any) => {
-    const caller = c.get("user") as UserRecord;
-    const grantId = c.req.param("grantId");
-    const grant = store.grants.find((g) => g.id === grantId);
-    if (!grant) return c.json({ error: "grant_not_found" }, 404);
-    if (grant.revoked_at) return c.json({ error: "grant_already_revoked" }, 409);
-    if (grant.owner_id !== caller.id && caller.role !== "admin") return c.json({ error: "only owner or admin can revoke grants" }, 403);
-    grant.revoked_at = new Date().toISOString();
-    return c.json({ ok: true, grantId, revoked: true });
-  });
-
-  return app;
+function req(path: string, opts?: { email?: string; method?: string; body?: unknown }) {
+  const headers: Record<string, string> = {};
+  if (opts?.email) headers["X-Test-Email"] = opts.email;
+  if (opts?.body) headers["Content-Type"] = "application/json";
+  return {
+    path,
+    init: {
+      method: opts?.method ?? "GET",
+      headers,
+      ...(opts?.body ? { body: JSON.stringify(opts.body) } : {}),
+    } as RequestInit,
+  };
 }
+
+const ADMIN = "andreas@meta-factory.ai";
+const OPERATOR = "jc@meta-factory.ai";
+const VIEWER = "viewer@meta-factory.ai";
 
 // =============================================================================
 // Tests
 // =============================================================================
 
 describe("/api/auth/me", () => {
+  let app: ReturnType<typeof buildTestApp>;
+  beforeEach(() => {
+    const { db, sqlite } = createTestDb();
+    seedTestData(sqlite);
+    app = buildTestApp(db);
+  });
+
   test("returns user profile with agents and grants", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/me", { headers: { "X-Test-Email": "andreas@meta-factory.ai" } });
+    const r = req("/api/auth/me", { email: ADMIN });
+    const res = await app.request(r.path, r.init);
     expect(res.status).toBe(200);
-    const body = await res.json() as any;
-    expect(body.user.id).toBe("andreas");
-    expect(body.agents.length).toBe(2); // luna + review-worker
-    expect(body.grants.given.length).toBe(1); // grant to jc
+    const body = await res.json() as Record<string, unknown>;
+    expect((body.user as Record<string, unknown>).id).toBe("andreas");
+    expect((body.agents as unknown[]).length).toBe(2); // luna + review-worker
+    const grants = body.grants as Record<string, unknown[]>;
+    expect(grants.given.length).toBe(1); // grant to jc
   });
 
   test("unauthenticated → 401", async () => {
-    const app = buildTestApp(defaultStore());
-    expect((await app.request("/api/auth/me")).status).toBe(401);
+    const res = await app.request("/api/auth/me");
+    expect(res.status).toBe(401);
+  });
+
+  test("unknown user → 401", async () => {
+    const r = req("/api/auth/me", { email: "nobody@example.com" });
+    const res = await app.request(r.path, r.init);
+    expect(res.status).toBe(401);
   });
 });
 
 describe("/api/auth/users", () => {
+  let app: ReturnType<typeof buildTestApp>;
+  beforeEach(() => {
+    const { db, sqlite } = createTestDb();
+    seedTestData(sqlite);
+    app = buildTestApp(db);
+  });
+
   test("admin sees all users", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/users", { headers: { "X-Test-Email": "andreas@meta-factory.ai" } });
+    const r = req("/api/auth/users", { email: ADMIN });
+    const res = await app.request(r.path, r.init);
     expect(res.status).toBe(200);
-    const body = await res.json() as any;
+    const body = await res.json() as Record<string, unknown[]>;
     expect(body.users.length).toBe(3);
   });
 
   test("operator → 403", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/users", { headers: { "X-Test-Email": "jc@meta-factory.ai" } });
-    expect(res.status).toBe(403);
+    const r = req("/api/auth/users", { email: OPERATOR });
+    expect((await app.request(r.path, r.init)).status).toBe(403);
   });
 
   test("viewer → 403", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/users", { headers: { "X-Test-Email": "viewer@meta-factory.ai" } });
-    expect(res.status).toBe(403);
+    const r = req("/api/auth/users", { email: VIEWER });
+    expect((await app.request(r.path, r.init)).status).toBe(403);
   });
 });
 
 describe("PUT /api/auth/users/:id/role", () => {
+  let app: ReturnType<typeof buildTestApp>;
+  let sqlite: InstanceType<typeof Database>;
+  beforeEach(() => {
+    const ctx = createTestDb();
+    sqlite = ctx.sqlite;
+    seedTestData(sqlite);
+    app = buildTestApp(ctx.db);
+  });
+
   test("admin changes role", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/users/jc/role", {
-      method: "PUT",
-      headers: { "X-Test-Email": "andreas@meta-factory.ai", "Content-Type": "application/json" },
-      body: JSON.stringify({ role: "admin" }),
+    const r = req("/api/auth/users/jc/role", {
+      email: ADMIN, method: "PUT", body: { role: "admin" },
     });
+    const res = await app.request(r.path, r.init);
     expect(res.status).toBe(200);
-    const body = await res.json() as any;
+    const body = await res.json() as Record<string, unknown>;
     expect(body.previous_role).toBe("operator");
     expect(body.new_role).toBe("admin");
+    // Verify in DB
+    const row = sqlite.prepare("SELECT role FROM users WHERE id = 'jc'").get() as { role: string };
+    expect(row.role).toBe("admin");
   });
 
   test("operator cannot change roles", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/users/viewer1/role", {
-      method: "PUT",
-      headers: { "X-Test-Email": "jc@meta-factory.ai", "Content-Type": "application/json" },
-      body: JSON.stringify({ role: "operator" }),
+    const r = req("/api/auth/users/viewer1/role", {
+      email: OPERATOR, method: "PUT", body: { role: "operator" },
     });
-    expect(res.status).toBe(403);
+    expect((await app.request(r.path, r.init)).status).toBe(403);
   });
 
   test("invalid role → 400", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/users/jc/role", {
-      method: "PUT",
-      headers: { "X-Test-Email": "andreas@meta-factory.ai", "Content-Type": "application/json" },
-      body: JSON.stringify({ role: "superadmin" }),
+    const r = req("/api/auth/users/jc/role", {
+      email: ADMIN, method: "PUT", body: { role: "superadmin" },
     });
-    expect(res.status).toBe(400);
+    expect((await app.request(r.path, r.init)).status).toBe(400);
+  });
+
+  test("user not found → 404", async () => {
+    const r = req("/api/auth/users/nonexistent/role", {
+      email: ADMIN, method: "PUT", body: { role: "operator" },
+    });
+    expect((await app.request(r.path, r.init)).status).toBe(404);
+  });
+
+  test("cannot demote last admin → 409", async () => {
+    const r = req("/api/auth/users/andreas/role", {
+      email: ADMIN, method: "PUT", body: { role: "viewer" },
+    });
+    const res = await app.request(r.path, r.init);
+    expect(res.status).toBe(409);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.error).toBe("cannot_demote_last_admin");
+  });
+
+  test("can demote admin when another admin exists", async () => {
+    sqlite.run("UPDATE users SET role = 'admin' WHERE id = 'jc'");
+    const r = req("/api/auth/users/andreas/role", {
+      email: ADMIN, method: "PUT", body: { role: "operator" },
+    });
+    const res = await app.request(r.path, r.init);
+    expect(res.status).toBe(200);
   });
 });
 
 describe("/api/auth/agents", () => {
+  let app: ReturnType<typeof buildTestApp>;
+  beforeEach(() => {
+    const { db, sqlite } = createTestDb();
+    seedTestData(sqlite);
+    app = buildTestApp(db);
+  });
+
   test("admin sees all agents", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/agents", { headers: { "X-Test-Email": "andreas@meta-factory.ai" } });
+    const r = req("/api/auth/agents", { email: ADMIN });
+    const res = await app.request(r.path, r.init);
     expect(res.status).toBe(200);
-    const body = await res.json() as any;
+    const body = await res.json() as Record<string, unknown[]>;
     expect(body.agents.length).toBe(3);
   });
 
   test("operator sees own + delegated + cattle", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/agents", { headers: { "X-Test-Email": "jc@meta-factory.ai" } });
+    const r = req("/api/auth/agents", { email: OPERATOR });
+    const res = await app.request(r.path, r.init);
     expect(res.status).toBe(200);
-    const body = await res.json() as any;
+    const body = await res.json() as Record<string, unknown[]>;
     expect(body.owned.length).toBe(1); // ivy
     expect(body.delegated.length).toBe(1); // luna (via grant)
     expect(body.cattle.length).toBe(1); // review-worker
@@ -238,105 +341,229 @@ describe("/api/auth/agents", () => {
 });
 
 describe("/api/auth/agents/:agentId", () => {
-  test("returns agent detail with owner and grants", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/agents/luna", { headers: { "X-Test-Email": "andreas@meta-factory.ai" } });
+  let app: ReturnType<typeof buildTestApp>;
+  beforeEach(() => {
+    const { db, sqlite } = createTestDb();
+    seedTestData(sqlite);
+    app = buildTestApp(db);
+  });
+
+  test("owner sees agent detail with grants", async () => {
+    const r = req("/api/auth/agents/luna", { email: ADMIN });
+    const res = await app.request(r.path, r.init);
     expect(res.status).toBe(200);
-    const body = await res.json() as any;
-    expect(body.agent.id).toBe("luna");
-    expect(body.owner.id).toBe("andreas");
-    expect(body.grants.length).toBe(1);
+    const body = await res.json() as Record<string, unknown>;
+    expect((body.agent as Record<string, unknown>).id).toBe("luna");
+    expect((body.owner as Record<string, unknown>).id).toBe("andreas");
+    expect((body.grants as unknown[]).length).toBe(1);
+  });
+
+  test("grantee can see delegated agent", async () => {
+    const r = req("/api/auth/agents/luna", { email: OPERATOR });
+    const res = await app.request(r.path, r.init);
+    expect(res.status).toBe(200);
+  });
+
+  test("viewer without grant → 403", async () => {
+    const r = req("/api/auth/agents/luna", { email: VIEWER });
+    const res = await app.request(r.path, r.init);
+    expect(res.status).toBe(403);
+  });
+
+  test("any operator can see cattle agent", async () => {
+    const r = req("/api/auth/agents/review-worker", { email: OPERATOR });
+    const res = await app.request(r.path, r.init);
+    expect(res.status).toBe(200);
   });
 
   test("unknown agent → 404", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/agents/nonexistent", { headers: { "X-Test-Email": "andreas@meta-factory.ai" } });
-    expect(res.status).toBe(404);
+    const r = req("/api/auth/agents/nonexistent", { email: ADMIN });
+    expect((await app.request(r.path, r.init)).status).toBe(404);
   });
 });
 
 describe("POST /api/auth/agents/:agentId/grants", () => {
+  let app: ReturnType<typeof buildTestApp>;
+  beforeEach(() => {
+    const { db, sqlite } = createTestDb();
+    seedTestData(sqlite);
+    app = buildTestApp(db);
+  });
+
   test("owner creates grant", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/agents/luna/grants", {
-      method: "POST",
-      headers: { "X-Test-Email": "andreas@meta-factory.ai", "Content-Type": "application/json" },
-      body: JSON.stringify({ grantee_id: "viewer1", scope: "read" }),
+    const r = req("/api/auth/agents/luna/grants", {
+      email: ADMIN, method: "POST",
+      body: { grantee_id: "viewer1", scope: "read" },
     });
+    const res = await app.request(r.path, r.init);
     expect(res.status).toBe(201);
-    const body = await res.json() as any;
+    const body = await res.json() as Record<string, unknown>;
     expect(body.ok).toBe(true);
   });
 
   test("non-owner non-admin → 403", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/agents/luna/grants", {
-      method: "POST",
-      headers: { "X-Test-Email": "jc@meta-factory.ai", "Content-Type": "application/json" },
-      body: JSON.stringify({ grantee_id: "viewer1", scope: "read" }),
+    const r = req("/api/auth/agents/luna/grants", {
+      email: OPERATOR, method: "POST",
+      body: { grantee_id: "viewer1", scope: "read" },
     });
-    expect(res.status).toBe(403);
+    expect((await app.request(r.path, r.init)).status).toBe(403);
   });
 
   test("admin can create grant on any agent", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/agents/ivy/grants", {
-      method: "POST",
-      headers: { "X-Test-Email": "andreas@meta-factory.ai", "Content-Type": "application/json" },
-      body: JSON.stringify({ grantee_id: "viewer1", scope: "read" }),
+    const r = req("/api/auth/agents/ivy/grants", {
+      email: ADMIN, method: "POST",
+      body: { grantee_id: "viewer1", scope: "read" },
     });
-    expect(res.status).toBe(201);
+    expect((await app.request(r.path, r.init)).status).toBe(201);
   });
 
   test("missing fields → 400", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/agents/luna/grants", {
-      method: "POST",
-      headers: { "X-Test-Email": "andreas@meta-factory.ai", "Content-Type": "application/json" },
-      body: JSON.stringify({ grantee_id: "viewer1" }),
+    const r = req("/api/auth/agents/luna/grants", {
+      email: ADMIN, method: "POST",
+      body: { grantee_id: "viewer1" },
     });
-    expect(res.status).toBe(400);
+    expect((await app.request(r.path, r.init)).status).toBe(400);
+  });
+
+  test("invalid scope → 400", async () => {
+    const r = req("/api/auth/agents/luna/grants", {
+      email: ADMIN, method: "POST",
+      body: { grantee_id: "viewer1", scope: "supercontrol" },
+    });
+    expect((await app.request(r.path, r.init)).status).toBe(400);
+  });
+
+  test("grantee_id too long → 400", async () => {
+    const r = req("/api/auth/agents/luna/grants", {
+      email: ADMIN, method: "POST",
+      body: { grantee_id: "x".repeat(200), scope: "read" },
+    });
+    expect((await app.request(r.path, r.init)).status).toBe(400);
+  });
+
+  test("invalid expires_at → 400", async () => {
+    const r = req("/api/auth/agents/luna/grants", {
+      email: ADMIN, method: "POST",
+      body: { grantee_id: "viewer1", scope: "read", expires_at: "not-a-date" },
+    });
+    expect((await app.request(r.path, r.init)).status).toBe(400);
+  });
+
+  test("valid expires_at accepted", async () => {
+    const r = req("/api/auth/agents/luna/grants", {
+      email: ADMIN, method: "POST",
+      body: { grantee_id: "viewer1", scope: "read", expires_at: "2027-01-01T00:00:00Z" },
+    });
+    expect((await app.request(r.path, r.init)).status).toBe(201);
+  });
+});
+
+describe("GET /api/auth/agents/:agentId/grants", () => {
+  let app: ReturnType<typeof buildTestApp>;
+  beforeEach(() => {
+    const { db, sqlite } = createTestDb();
+    seedTestData(sqlite);
+    app = buildTestApp(db);
+  });
+
+  test("owner can list grants", async () => {
+    const r = req("/api/auth/agents/luna/grants", { email: ADMIN });
+    const res = await app.request(r.path, r.init);
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown[]>;
+    expect(body.grants.length).toBe(1);
+  });
+
+  test("viewer without access → 403", async () => {
+    const r = req("/api/auth/agents/luna/grants", { email: VIEWER });
+    expect((await app.request(r.path, r.init)).status).toBe(403);
+  });
+
+  test("unknown agent → 404", async () => {
+    const r = req("/api/auth/agents/nonexistent/grants", { email: ADMIN });
+    expect((await app.request(r.path, r.init)).status).toBe(404);
   });
 });
 
 describe("DELETE /api/auth/grants/:grantId", () => {
+  let app: ReturnType<typeof buildTestApp>;
+  let sqlite: InstanceType<typeof Database>;
+  beforeEach(() => {
+    const ctx = createTestDb();
+    sqlite = ctx.sqlite;
+    seedTestData(sqlite);
+    app = buildTestApp(ctx.db);
+  });
+
   test("owner revokes grant", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/grants/grant-1", {
-      method: "DELETE",
-      headers: { "X-Test-Email": "andreas@meta-factory.ai" },
-    });
+    const r = req("/api/auth/grants/grant-1", { email: ADMIN, method: "DELETE" });
+    const res = await app.request(r.path, r.init);
     expect(res.status).toBe(200);
-    const body = await res.json() as any;
+    const body = await res.json() as Record<string, unknown>;
     expect(body.revoked).toBe(true);
+    // Verify in DB
+    const row = sqlite.prepare("SELECT revoked_at FROM agent_grants WHERE id = 'grant-1'").get() as { revoked_at: string | null };
+    expect(row.revoked_at).not.toBeNull();
   });
 
   test("non-owner non-admin → 403", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/grants/grant-1", {
-      method: "DELETE",
-      headers: { "X-Test-Email": "jc@meta-factory.ai" },
-    });
-    expect(res.status).toBe(403);
+    const r = req("/api/auth/grants/grant-1", { email: OPERATOR, method: "DELETE" });
+    expect((await app.request(r.path, r.init)).status).toBe(403);
   });
 
   test("unknown grant → 404", async () => {
-    const app = buildTestApp(defaultStore());
-    const res = await app.request("/api/auth/grants/nonexistent", {
-      method: "DELETE",
-      headers: { "X-Test-Email": "andreas@meta-factory.ai" },
-    });
-    expect(res.status).toBe(404);
+    const r = req("/api/auth/grants/nonexistent", { email: ADMIN, method: "DELETE" });
+    expect((await app.request(r.path, r.init)).status).toBe(404);
   });
 
   test("already revoked → 409", async () => {
-    const store = defaultStore();
-    store.grants[0]!.revoked_at = "2026-01-02";
-    const app = buildTestApp(store);
-    const res = await app.request("/api/auth/grants/grant-1", {
-      method: "DELETE",
-      headers: { "X-Test-Email": "andreas@meta-factory.ai" },
+    sqlite.run("UPDATE agent_grants SET revoked_at = datetime('now') WHERE id = 'grant-1'");
+    const r = req("/api/auth/grants/grant-1", { email: ADMIN, method: "DELETE" });
+    expect((await app.request(r.path, r.init)).status).toBe(409);
+  });
+});
+
+// =============================================================================
+// Audit logging verification
+// =============================================================================
+
+describe("audit logging", () => {
+  let app: ReturnType<typeof buildTestApp>;
+  let sqlite: InstanceType<typeof Database>;
+  beforeEach(() => {
+    const ctx = createTestDb();
+    sqlite = ctx.sqlite;
+    seedTestData(sqlite);
+    app = buildTestApp(ctx.db);
+  });
+
+  test("successful auth is audited", async () => {
+    const r = req("/api/auth/me", { email: ADMIN });
+    await app.request(r.path, r.init);
+    const row = sqlite.prepare(
+      "SELECT * FROM audit_log WHERE event_type = 'auth' AND result = 'success'",
+    ).get() as Record<string, unknown> | null;
+    expect(row).not.toBeNull();
+    expect(row!.identity).toBe("andreas@meta-factory.ai");
+  });
+
+  test("failed auth is audited", async () => {
+    await app.request("/api/auth/me");
+    const row = sqlite.prepare(
+      "SELECT * FROM audit_log WHERE event_type = 'auth' AND result = 'failure'",
+    ).get() as Record<string, unknown> | null;
+    expect(row).not.toBeNull();
+  });
+
+  test("grant 403 is audited", async () => {
+    const r = req("/api/auth/agents/luna/grants", {
+      email: OPERATOR, method: "POST",
+      body: { grantee_id: "viewer1", scope: "read" },
     });
-    expect(res.status).toBe(409);
+    await app.request(r.path, r.init);
+    const row = sqlite.prepare(
+      "SELECT * FROM audit_log WHERE event_type = 'grant_create' AND result = 'failure'",
+    ).get() as Record<string, unknown> | null;
+    expect(row).not.toBeNull();
   });
 });
