@@ -91,6 +91,8 @@ admin    -> can trigger destructive actions (deploy, delete, agent exec)
 
 **Agent-level authorization** has two dimensions: **ownership** and **agent class**.
 
+**Implementation note:** The `requireAgentAccess()` middleware resolves access through owner → grant → admin → cattle checks. To avoid compound D1 latency on every request, implement as a single JOIN query (user + agent + grants) rather than sequential lookups.
+
 **Layer 3 — Step-Up (WebAuthn/PassKeys)**
 Privileged actions require a PassKey assertion — but **not universally**. Step-up is contextual:
 
@@ -223,23 +225,7 @@ This mirrors grove's existing pattern: the system tells you what you can do and 
 
 ### Grant Model
 
-```sql
-CREATE TABLE agent_grants (
-  id TEXT PRIMARY KEY,
-  agent_id TEXT NOT NULL,            -- "luna", "sage"
-  owner_id TEXT NOT NULL,            -- operator who owns the agent (grantor)
-  grantee_id TEXT NOT NULL,          -- operator receiving access (recipient)
-  scope TEXT NOT NULL DEFAULT 'read', -- 'read' | 'review' | 'control'
-  requires_stepup INTEGER DEFAULT 1,  -- does grantee need their own PassKey?
-  expires_at TEXT,                    -- null = until revoked
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  revoked_at TEXT,                    -- null = active
-  FOREIGN KEY (owner_id) REFERENCES users(id),
-  FOREIGN KEY (grantee_id) REFERENCES users(id)
-);
-CREATE INDEX idx_grant_grantee ON agent_grants(grantee_id);
-CREATE INDEX idx_grant_agent ON agent_grants(agent_id);
-```
+See the `agent_grants` table in the [D1 Schema](#d1-schema) section for the full DDL. Key columns: `scope` (read/review/control), `requires_stepup`, `expires_at`, `revoked_at`.
 
 ### Scope Levels
 
@@ -382,7 +368,7 @@ CREATE TABLE users (
   id TEXT PRIMARY KEY,
   email TEXT UNIQUE NOT NULL,
   display_name TEXT,
-  role TEXT NOT NULL DEFAULT 'viewer',  -- viewer | operator | admin
+  role TEXT NOT NULL DEFAULT 'viewer' CHECK(role IN ('viewer', 'operator', 'admin')),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -392,7 +378,7 @@ CREATE TABLE agents (
   id TEXT PRIMARY KEY,               -- "luna", "ivy", "sage"
   display_name TEXT NOT NULL,        -- "Luna"
   owner_id TEXT NOT NULL,            -- operator who owns this agent
-  class TEXT NOT NULL DEFAULT 'pet', -- 'pet' | 'cattle' (cattle rarely stored)
+  class TEXT NOT NULL DEFAULT 'pet' CHECK(class IN ('pet', 'cattle')),
   backend TEXT,                      -- 'local' | 'ec2' | 'worker'
   spawn_profile TEXT,                -- spawn manifest reference: "luna.yaml"
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -406,7 +392,7 @@ CREATE TABLE agent_grants (
   agent_id TEXT NOT NULL,
   owner_id TEXT NOT NULL,             -- grantor (must own the agent)
   grantee_id TEXT NOT NULL,           -- recipient
-  scope TEXT NOT NULL DEFAULT 'read', -- 'read' | 'review' | 'control'
+  scope TEXT NOT NULL DEFAULT 'read' CHECK(scope IN ('read', 'review', 'control')),
   requires_stepup INTEGER DEFAULT 1,  -- does grantee need PassKey?
   expires_at TEXT,                    -- null = until revoked
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -436,6 +422,16 @@ CREATE INDEX idx_passkey_user ON passkey_credentials(user_id);
 -- Extends existing audit_log with auth events
 -- (audit_log table already exists in grove Worker)
 ```
+
+**Grant query filtering:** All grant lookups MUST filter on active grants only:
+```sql
+WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > datetime('now'))
+```
+Revoked and expired grants are retained in the table for audit trail but never honored for access decisions. The `requireAgentAccess()` middleware must apply this filter — not rely on callers to pass it.
+
+**Rate limiting:** The `POST /api/auth/agents/:id/request-access` endpoint must be rate-limited (5 requests per agent per hour per user) to prevent access request spam.
+
+**Action token grant validation:** When an action token includes `authz.grant_id`, the grant MUST be re-validated at token consumption time (not just minting time). Grants can be revoked between token creation and use.
 
 **KV keys:**
 
@@ -470,6 +466,8 @@ Human clicks "Review" on dashboard
 grove-auth answers **"who can do what."** Spawn's SSM answers **"with what credentials."** The action token is the handshake — grove-auth signs it, spawn verifies it before provisioning.
 
 No changes needed to spawn's SecretResolver for grove-auth. The integration is the action token verification that spawn has planned in its Iteration 4 (S-010).
+
+**Cross-repo dependency:** grove-auth Phase 3 (action tokens) depends on spawn S-010 (action token verification). This must be tracked in `blueprint.yaml` to prevent grove-auth Phase 3 from shipping before spawn is ready to verify tokens.
 
 ---
 
