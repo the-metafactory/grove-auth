@@ -81,10 +81,10 @@
 
 ---
 
-## 1.5 — API: Auth Endpoints (in progress)
+## 1.5 — API: Auth Endpoints ✓
 
-**Branch:** `feat/ga-5-auth-api` | **Worktree:** `../grove-auth-api`
-**Files:** `src/routes/auth.ts`, `src/routes/auth.test.ts`, `src/index.ts`
+**Branch:** `feat/ga-5-auth-api` | **PR:** #12 (merged) | **Release:** v0.4.0
+**Files:** `src/routes/auth.ts`, `src/routes/auth.test.ts`, `src/middleware/require-auth.ts`, `src/index.ts`
 
 Exported as a Hono route group (`authRoutes`) for consuming Workers to mount.
 
@@ -92,25 +92,28 @@ Exported as a Hono route group (`authRoutes`) for consuming Workers to mount.
 - [x] `GET /api/auth/me` — current user profile + owned agents + active grants (received and given)
 
 **User management (admin only):**
-- [x] `GET /api/auth/users` — list all users
-- [x] `PUT /api/auth/users/:id/role` — change user role
+- [x] `GET /api/auth/users` — list all users (paginated)
+- [x] `PUT /api/auth/users/:id/role` — change user role (last-admin guard)
 
 **Agent registry:**
-- [x] `GET /api/auth/agents` — list agents filtered by caller context:
+- [x] `GET /api/auth/agents` — list agents filtered by caller context (paginated for admin):
   - Operators: own agents + delegated agents + cattle (with relationship badges)
   - Admin: all agents
-- [x] `GET /api/auth/agents/:id` — agent detail with ownership + grant info
+- [x] `GET /api/auth/agents/:id` — agent detail with ownership + grant info (authz via `checkAgentAccess`)
 
 **Delegation:**
 - [x] `POST /api/auth/agents/:id/grants` — create grant (owner or admin only)
   - Body: `{ grantee_id, scope, requires_stepup, expires_at }`
-- [x] `GET /api/auth/agents/:id/grants` — list grants for an agent
+  - Input validation: scope allowlist, grantee_id length, expires_at datetime, self-grant prevention
+- [x] `GET /api/auth/agents/:id/grants` — list grants for agent (paginated, authz)
 - [x] `DELETE /api/auth/grants/:id` — revoke grant (sets revoked_at, retains for audit)
 - [ ] `POST /api/auth/agents/:id/request-access` — request access (notifies owner) — deferred to Phase 2 (requires notification infrastructure)
 
-All endpoints behind inline auth middleware (CF Access JWT → D1 user lookup). All mutations audit-logged. 20 new tests (46 total), TypeScript clean.
-
-**Status:** Code complete, committed locally. Not yet pushed / PR not yet created.
+**Auth architecture:**
+- [x] Shared `requireAuth()` middleware extracted (`src/middleware/require-auth.ts`)
+- [x] `requireRole()` refactored to use `authenticateUser()` from require-auth
+- [x] All 8 endpoints audit log both success and failure (auth + authz 403s)
+- [x] 70 tests passing (tests mount real `authRoutes` with Bun SQLite-backed D1 mock)
 
 ---
 
