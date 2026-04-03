@@ -1,7 +1,19 @@
 {
   "name": "grove-auth",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "type": "module",
   "private": true,
-  "description": "Authentication, authorization, and device trust for the metafactory ecosystem"
+  "description": "Authentication, authorization, and device trust for the metafactory ecosystem",
+  "main": "src/index.ts",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "hono": "^4.7.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250327.0",
+    "typescript": "^5.8.0"
+  }
 }
