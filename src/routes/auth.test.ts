@@ -237,6 +237,25 @@ describe("/api/auth/users", () => {
     expect(body.users.length).toBe(3);
   });
 
+  test("respects limit param", async () => {
+    const r = req("/api/auth/users?limit=1", { email: ADMIN });
+    const res = await app.request(r.path, r.init);
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect((body.users as unknown[]).length).toBe(1);
+    expect(body.limit).toBe(1);
+    expect(body.offset).toBe(0);
+  });
+
+  test("respects offset param", async () => {
+    const r = req("/api/auth/users?limit=1&offset=1", { email: ADMIN });
+    const res = await app.request(r.path, r.init);
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect((body.users as unknown[]).length).toBe(1);
+    expect(body.offset).toBe(1);
+  });
+
   test("operator → 403", async () => {
     const r = req("/api/auth/users", { email: OPERATOR });
     expect((await app.request(r.path, r.init)).status).toBe(403);
@@ -325,8 +344,17 @@ describe("/api/auth/agents", () => {
     const r = req("/api/auth/agents", { email: ADMIN });
     const res = await app.request(r.path, r.init);
     expect(res.status).toBe(200);
-    const body = await res.json() as Record<string, unknown[]>;
-    expect(body.agents.length).toBe(3);
+    const body = await res.json() as Record<string, unknown>;
+    expect((body.agents as unknown[]).length).toBe(3);
+  });
+
+  test("admin agents respects pagination", async () => {
+    const r = req("/api/auth/agents?limit=2", { email: ADMIN });
+    const res = await app.request(r.path, r.init);
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect((body.agents as unknown[]).length).toBe(2);
+    expect(body.limit).toBe(2);
   });
 
   test("operator sees own + delegated + cattle", async () => {
@@ -456,6 +484,17 @@ describe("POST /api/auth/agents/:agentId/grants", () => {
     });
     expect((await app.request(r.path, r.init)).status).toBe(201);
   });
+
+  test("self-grant to agent owner → 400", async () => {
+    const r = req("/api/auth/agents/luna/grants", {
+      email: ADMIN, method: "POST",
+      body: { grantee_id: "andreas", scope: "read" },
+    });
+    const res = await app.request(r.path, r.init);
+    expect(res.status).toBe(400);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.error).toBe("cannot grant to agent owner");
+  });
 });
 
 describe("GET /api/auth/agents/:agentId/grants", () => {
@@ -482,6 +521,15 @@ describe("GET /api/auth/agents/:agentId/grants", () => {
   test("unknown agent → 404", async () => {
     const r = req("/api/auth/agents/nonexistent/grants", { email: ADMIN });
     expect((await app.request(r.path, r.init)).status).toBe(404);
+  });
+
+  test("respects pagination params", async () => {
+    const r = req("/api/auth/agents/luna/grants?limit=10&offset=0", { email: ADMIN });
+    const res = await app.request(r.path, r.init);
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.limit).toBe(10);
+    expect(body.offset).toBe(0);
   });
 });
 

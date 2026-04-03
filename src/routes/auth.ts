@@ -16,14 +16,72 @@
  */
 
 import { Hono } from "hono";
+import type { Context } from "hono";
 import type { AuthBindings, AgentRecord, GrantScope, Role, UserRecord } from "../types";
 import { checkRole, checkAgentAccess } from "../authorize";
 import { logAuditEvent, getClientIp } from "../middleware/audit";
 import { requireAuth } from "../middleware/require-auth";
 
 const MAX_ID_LENGTH = 128;
+const DEFAULT_PAGE_LIMIT = 50;
+const MAX_PAGE_LIMIT = 200;
 
 type AuthEnv = { Bindings: AuthBindings; Variables: { user: UserRecord } };
+
+// ---------------------------------------------------------------------------
+// Pagination helper — extracts limit/offset from query params with bounds
+// ---------------------------------------------------------------------------
+
+function parsePagination(c: Context): { limit: number; offset: number } {
+  const rawLimit = parseInt(c.req.query("limit") ?? "", 10);
+  const rawOffset = parseInt(c.req.query("offset") ?? "", 10);
+  const limit = Math.min(
+    Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : DEFAULT_PAGE_LIMIT,
+    MAX_PAGE_LIMIT,
+  );
+  const offset = Number.isFinite(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+  return { limit, offset };
+}
+
+// ---------------------------------------------------------------------------
+// Agent access resolution — shared by agent detail + grant listing endpoints
+// ---------------------------------------------------------------------------
+
+async function resolveAgentAccess(
+  c: Context<AuthEnv>,
+): Promise<{ agent: AgentRecord } | Response> {
+  const user = c.get("user");
+  const agentId = c.req.param("agentId");
+  const db = c.env.GROVE_DB;
+
+  const agent = await db.prepare("SELECT * FROM agents WHERE id = ?").bind(agentId).first<AgentRecord>();
+  if (!agent) {
+    return c.json({ error: "agent_not_found", agentId }, 404);
+  }
+
+  const grantRow = await db.prepare(`
+    SELECT scope FROM agent_grants
+    WHERE agent_id = ? AND grantee_id = ? AND revoked_at IS NULL
+    AND (expires_at IS NULL OR expires_at > datetime('now'))
+    ORDER BY CASE scope WHEN 'control' THEN 2 WHEN 'review' THEN 1 WHEN 'read' THEN 0 END DESC
+    LIMIT 1
+  `).bind(agentId, user.id).first<{ scope: GrantScope }>();
+
+  const access = checkAgentAccess({
+    userId: user.id,
+    userRole: user.role,
+    agentOwnerId: agent.owner_id,
+    agentClass: agent.class,
+    grantScope: grantRow?.scope ?? null,
+    requiredScope: "read",
+  });
+
+  if (!access.allowed) {
+    return c.json({ error: "no_agent_access", agentId }, 403);
+  }
+
+  return { agent };
+}
 
 export const authRoutes = new Hono<AuthEnv>();
 
@@ -77,8 +135,11 @@ authRoutes.get("/api/auth/users", async (c) => {
     return c.json({ error: result.error, required: result.required, current: result.current }, 403);
   }
 
-  const users = await c.env.GROVE_DB.prepare("SELECT * FROM users ORDER BY created_at").all();
-  return c.json({ users: users.results });
+  const { limit, offset } = parsePagination(c);
+  const users = await c.env.GROVE_DB.prepare(
+    "SELECT * FROM users ORDER BY created_at LIMIT ? OFFSET ?",
+  ).bind(limit, offset).all();
+  return c.json({ users: users.results, limit, offset });
 });
 
 // ---------------------------------------------------------------------------
@@ -137,8 +198,11 @@ authRoutes.get("/api/auth/agents", async (c) => {
   const db = c.env.GROVE_DB;
 
   if (user.role === "admin") {
-    const agents = await db.prepare("SELECT * FROM agents ORDER BY created_at").all();
-    return c.json({ agents: agents.results });
+    const { limit, offset } = parsePagination(c);
+    const agents = await db.prepare(
+      "SELECT * FROM agents ORDER BY created_at LIMIT ? OFFSET ?",
+    ).bind(limit, offset).all();
+    return c.json({ agents: agents.results, limit, offset });
   }
 
   // Operators/viewers: own agents + delegated + cattle
@@ -165,36 +229,12 @@ authRoutes.get("/api/auth/agents", async (c) => {
 // ---------------------------------------------------------------------------
 
 authRoutes.get("/api/auth/agents/:agentId", async (c) => {
-  const user = c.get("user");
+  const result = await resolveAgentAccess(c);
+  if (result instanceof Response) return result;
+  const { agent } = result;
+
   const agentId = c.req.param("agentId");
   const db = c.env.GROVE_DB;
-
-  const agent = await db.prepare("SELECT * FROM agents WHERE id = ?").bind(agentId).first<AgentRecord>();
-  if (!agent) {
-    return c.json({ error: "agent_not_found", agentId }, 404);
-  }
-
-  // Authorization: owner → grant → admin → cattle
-  const grantRow = await db.prepare(`
-    SELECT scope FROM agent_grants
-    WHERE agent_id = ? AND grantee_id = ? AND revoked_at IS NULL
-    AND (expires_at IS NULL OR expires_at > datetime('now'))
-    ORDER BY CASE scope WHEN 'control' THEN 2 WHEN 'review' THEN 1 WHEN 'read' THEN 0 END DESC
-    LIMIT 1
-  `).bind(agentId, user.id).first<{ scope: GrantScope }>();
-
-  const access = checkAgentAccess({
-    userId: user.id,
-    userRole: user.role,
-    agentOwnerId: agent.owner_id,
-    agentClass: agent.class,
-    grantScope: grantRow?.scope ?? null,
-    requiredScope: "read",
-  });
-
-  if (!access.allowed) {
-    return c.json({ error: "no_agent_access", agentId }, 403);
-  }
 
   const [grants, owner] = await Promise.all([
     db.prepare(`
@@ -204,7 +244,7 @@ authRoutes.get("/api/auth/agents/:agentId", async (c) => {
     `).bind(agentId).all(),
     db.prepare(
       "SELECT id, display_name, email FROM users WHERE id = ?",
-    ).bind(agent.owner_id).first(),
+    ).bind(agent.owner_id).first<{ id: string; display_name: string | null; email: string }>(),
   ]);
 
   return c.json({ agent, owner, grants: grants.results });
@@ -251,6 +291,9 @@ authRoutes.post("/api/auth/agents/:agentId/grants", async (c) => {
   if (body.grantee_id.length > MAX_ID_LENGTH) {
     return c.json({ error: "grantee_id too long" }, 400);
   }
+  if (body.grantee_id === agent.owner_id) {
+    return c.json({ error: "cannot grant to agent owner" }, 400);
+  }
   if (body.expires_at && isNaN(Date.parse(body.expires_at))) {
     return c.json({ error: "invalid expires_at format" }, 400);
   }
@@ -290,45 +333,22 @@ authRoutes.post("/api/auth/agents/:agentId/grants", async (c) => {
 // ---------------------------------------------------------------------------
 
 authRoutes.get("/api/auth/agents/:agentId/grants", async (c) => {
-  const user = c.get("user");
+  const result = await resolveAgentAccess(c);
+  if (result instanceof Response) return result;
+
   const agentId = c.req.param("agentId");
   const db = c.env.GROVE_DB;
-
-  const agent = await db.prepare("SELECT * FROM agents WHERE id = ?").bind(agentId).first<AgentRecord>();
-  if (!agent) {
-    return c.json({ error: "agent_not_found", agentId }, 404);
-  }
-
-  // Authorization: owner → grant → admin → cattle
-  const grantRow = await db.prepare(`
-    SELECT scope FROM agent_grants
-    WHERE agent_id = ? AND grantee_id = ? AND revoked_at IS NULL
-    AND (expires_at IS NULL OR expires_at > datetime('now'))
-    ORDER BY CASE scope WHEN 'control' THEN 2 WHEN 'review' THEN 1 WHEN 'read' THEN 0 END DESC
-    LIMIT 1
-  `).bind(agentId, user.id).first<{ scope: GrantScope }>();
-
-  const access = checkAgentAccess({
-    userId: user.id,
-    userRole: user.role,
-    agentOwnerId: agent.owner_id,
-    agentClass: agent.class,
-    grantScope: grantRow?.scope ?? null,
-    requiredScope: "read",
-  });
-
-  if (!access.allowed) {
-    return c.json({ error: "no_agent_access", agentId }, 403);
-  }
+  const { limit, offset } = parsePagination(c);
 
   const grants = await db.prepare(`
     SELECT g.*, u.display_name AS grantee_name, u.email AS grantee_email
     FROM agent_grants g JOIN users u ON g.grantee_id = u.id
     WHERE g.agent_id = ?
     ORDER BY g.created_at DESC
-  `).bind(agentId).all();
+    LIMIT ? OFFSET ?
+  `).bind(agentId, limit, offset).all();
 
-  return c.json({ grants: grants.results });
+  return c.json({ grants: grants.results, limit, offset });
 });
 
 // ---------------------------------------------------------------------------
